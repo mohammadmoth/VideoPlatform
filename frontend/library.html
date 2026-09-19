@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Video library</title>
+    <style>
+        body { margin: 0; background: #121212; color: #eee; font: 16px system-ui, sans-serif; }
+        main { max-width: 1000px; margin: auto; padding: 24px 16px; }
+        .toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; }
+        label { display: grid; gap: 4px; }
+        select, button { font: inherit; padding: 9px 12px; }
+        button { cursor: pointer; }
+        ul { list-style: none; padding: 0; display: grid; gap: 8px; }
+        .video { width: 100%; text-align: left; border: 1px solid #555; border-radius: 4px; background: #252525; color: inherit; }
+        .video:hover, .video:focus { background: #383838; }
+        #error { color: #ffb4ab; }
+        [hidden] { display: none !important; }
+    </style>
+    <script defer src="/library.js"></script>
+</head>
+<body>
+<main>
+    <header><h1>Video library</h1><p>Select a video for every connected screen. Selection pauses at the beginning.</p></header>
+    <section class="toolbar" aria-label="Library controls">
+        <label>Collection <select id="collection"></select></label>
+        <label>Section <select id="section"></select></label>
+        <label>Sort
+            <select id="sort">
+                <option value="name-asc">Name: A to Z</option>
+                <option value="name-desc">Name: Z to A</option>
+                <option value="added-asc">Added: oldest first</option>
+                <option value="added-desc">Added: newest first</option>
+            </select>
+        </label>
+        <button id="refresh" type="button">Refresh</button>
+    </section>
+    <p id="status" role="status">Loading library…</p>
+    <p id="error" role="alert"></p>
+    <section aria-labelledby="videos-heading">
+        <h2 id="videos-heading">Videos</h2>
+        <ul id="videos"></ul>
+    </section>
+</main>
+</body>
+</html>

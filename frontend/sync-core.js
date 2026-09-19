@@ -35,7 +35,11 @@
         return false;
     }
 
-    const api = { Clock, targetTime, correction, hasRunway };
+    function completionAction(master, playing) {
+        return master && playing ? 'pause' : null;
+    }
+
+    const api = { Clock, targetTime, correction, hasRunway, completionAction };
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     else root.VideoSync = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

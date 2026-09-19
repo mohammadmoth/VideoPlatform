@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { SyncRoom } = require('../lib/sync-room');
-const { Clock, targetTime, correction, hasRunway } = require('../pub/sync-core');
+const { Clock, targetTime, correction, hasRunway, completionAction } = require('../frontend/sync-core');
 
 function setup() {
     let time = 100000;
@@ -14,7 +14,9 @@ function setup() {
     return { room, master, display, advance: ms => { time += ms; } };
 }
 const command = (room, client, action, extra = {}) => room.receive(client, { type: 'command', action, ...extra });
-const ready = (room, client, version = room.pending.message.version) => room.receive(client, { type: 'ready', version });
+const ready = (room, client, version = room.pending.message.version) => room.receive(client, {
+    type: 'ready', version, mediaGeneration: room.pending.message.mediaGeneration,
+});
 
 test('clock removes device clock skew using RTT midpoint, preferring low latency', () => {
     const clock = new Clock();
@@ -34,6 +36,9 @@ test('target handles zero, future start, paused state and media end without abso
     assert.equal(targetTime(state, 1500, 100), 0.5);
     assert.equal(targetTime({ ...state, playing: false }, 5000, 100), 0);
     assert.equal(targetTime(state, 5000, 2), 2);
+    assert.equal(completionAction(true, true), 'pause');
+    assert.equal(completionAction(false, true), null);
+    assert.equal(completionAction(true, false), null);
 });
 
 test('small drift adjusts rate rather than seeking; large drift seeks', () => {
@@ -95,7 +100,8 @@ test('buffer loss revokes readiness while waiting', () => {
     const { room, master, display } = setup();
     command(room, master, 'play');
     ready(room, master);
-    room.receive(master, { type: 'not-ready', version: room.pending.message.version });
+    room.receive(master, { type: 'not-ready', version: room.pending.message.version,
+        mediaGeneration: room.pending.message.mediaGeneration });
     ready(room, display);
     assert.equal(room.state.playing, false);
     ready(room, master);
@@ -160,7 +166,8 @@ test('scheduled start can still be cancelled by readiness revocation', () => {
     const preparationVersion = room.pending.message.version;
     ready(room, master); ready(room, display);
     advance(400);
-    room.receive(display, { type: 'not-ready', version: preparationVersion });
+    room.receive(display, { type: 'not-ready', version: preparationVersion,
+        mediaGeneration: room.pending.message.mediaGeneration });
     assert.equal(room.state.playing, false);
     assert.ok(room.pending.message.version > preparationVersion);
     ready(room, master, preparationVersion);
@@ -205,7 +212,7 @@ test('stale playback failures do not cancel a newer operation', () => {
     command(room, master, 'play'); ready(room, master); ready(room, display);
     const version = room.state.version;
     command(room, master, 'seek', { position: 10 });
-    room.receive(display, { type: 'playback-error', version });
+    room.receive(display, { type: 'playback-error', version, mediaGeneration: room.state.mediaGeneration });
     assert.equal(room.pending.message.position, 10);
     ready(room, master); ready(room, display);
     assert.equal(room.state.playing, true);
@@ -234,7 +241,101 @@ test('readiness accepts MP4 timestamp priming but requires a buffered runway', (
 test('playback rejection pauses all screens', () => {
     const { room, master, display } = setup();
     command(room, master, 'play'); ready(room, master); ready(room, display);
-    room.receive(display, { type: 'playback-error', version: room.state.version });
+    room.receive(display, { type: 'playback-error', version: room.state.version,
+        mediaGeneration: room.state.mediaGeneration });
     assert.equal(room.state.playing, false);
     assert.match(master.messages.at(-1).message, /could not play/);
+});
+
+test('only the master selects validated media and selection is reconnectable paused room state', () => {
+    let time = 1000;
+    const media = new Map([['valid', { id: 'valid', name: 'Episode 1', url: '/media/valid' }]]);
+    const room = new SyncRoom({ now: () => time, resolveMedia: id => media.get(id) || null });
+    const master = { messages: [], send(message) { this.messages.push(message); } };
+    const display = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(master, true); room.join(display, false);
+    room.receive(display, { type: 'command', action: 'select', mediaId: 'valid' });
+    room.receive(master, { type: 'command', action: 'select', mediaId: 'missing' });
+    assert.equal(room.state.media, null);
+    room.receive(master, { type: 'command', action: 'select', mediaId: 'valid' });
+    assert.equal(room.state.media.id, 'valid');
+    assert.equal(room.state.position, 0);
+    assert.equal(room.state.playing, false);
+    const generation = room.state.mediaGeneration;
+    const late = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(late, false);
+    assert.equal(late.messages.find(message => message.type === 'state').media.id, 'valid');
+    assert.equal(late.messages.find(message => message.type === 'state').mediaGeneration, generation);
+});
+
+test('controller capability transfers ownership during an overlapping library-to-player handoff', () => {
+    const room = new SyncRoom({ now: () => 1000 });
+    const library = { messages: [], send(message) { this.messages.push(message); } };
+    const player = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(library, true, null, false);
+    const token = library.messages.find(message => message.type === 'welcome').controllerToken;
+    room.join(player, true, token);
+    assert.equal(room.master, player);
+    assert.equal(room.clients.has(library), false);
+    assert.equal(player.messages.find(message => message.type === 'welcome').master, true);
+    const replacementToken = player.messages.find(message => message.type === 'welcome').controllerToken;
+    assert.notEqual(replacementToken, token);
+    assert.equal(room.isControllerToken(token), false);
+    assert.equal(room.isControllerToken(replacementToken), true);
+    assert.deepEqual(library.messages.findLast(message => message.type === 'role'), { type: 'role', master: false });
+    room.leave(library);
+    assert.equal(room.master, player);
+    command(room, player, 'play');
+    assert.deepEqual([...room.pending.waiting], [player]);
+});
+
+test('an already joined library can claim a newly vacant controller role', () => {
+    const room = new SyncRoom({ now: () => 1000 });
+    const owner = { messages: [], send(message) { this.messages.push(message); } };
+    const waitingLibrary = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(owner, true);
+    room.join(waitingLibrary, true, null, false);
+    assert.equal(room.master, owner);
+    room.leave(owner);
+    room.join(waitingLibrary, true, null, false);
+    assert.equal(room.master, waitingLibrary);
+    assert.equal(waitingLibrary.messages.findLast(message => message.type === 'role').master, true);
+});
+
+test('same-media load errors are operation-version scoped', () => {
+    const room = new SyncRoom({ now: () => 1000, resolveMedia: id => ({ id, url: `/media/${id}` }) });
+    const master = { messages: [], send(message) { this.messages.push(message); } };
+    const display = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(master, true); room.join(display, false);
+    room.receive(master, { type: 'command', action: 'select', mediaId: 'one' });
+    const selection = room.state;
+    room.receive(master, { type: 'command', action: 'play' });
+    const preparation = room.pending.message;
+    room.receive(display, { type: 'media-error', version: selection.version,
+        mediaGeneration: selection.mediaGeneration });
+    assert.equal(room.pending.message, preparation);
+    room.receive(display, { type: 'media-error', version: preparation.version,
+        mediaGeneration: preparation.mediaGeneration });
+    assert.equal(room.pending, null);
+    assert.equal(room.state.playing, false);
+});
+
+test('old-media readiness and errors cannot affect a newer selection', () => {
+    const media = id => ({ id, name: id, url: `/media/${id}` });
+    const room = new SyncRoom({ now: () => 1000, resolveMedia: media });
+    const master = { messages: [], send(message) { this.messages.push(message); } };
+    const display = { messages: [], send(message) { this.messages.push(message); } };
+    room.join(master, true); room.join(display, false);
+    room.receive(master, { type: 'command', action: 'select', mediaId: 'one' });
+    room.receive(master, { type: 'command', action: 'play' });
+    const old = room.pending.message;
+    room.receive(master, { type: 'command', action: 'select', mediaId: 'two' });
+    const current = room.state;
+    room.receive(display, { type: 'media-error', version: old.version,
+        mediaGeneration: old.mediaGeneration });
+    room.receive(display, { type: 'playback-error', version: old.version,
+        mediaGeneration: old.mediaGeneration });
+    room.receive(display, { type: 'ready', version: old.version, mediaGeneration: old.mediaGeneration });
+    assert.equal(room.state, current);
+    assert.equal(room.state.media.id, 'two');
 });

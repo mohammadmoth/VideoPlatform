@@ -1,10 +1,18 @@
-/* global VideoSync */
+/* global VideoSync, VideoNavigation */
 (() => {
     'use strict';
     const video = document.getElementById('myVideo');
-    const ui = Object.fromEntries(['join', 'sound', 'fullscreen', 'role', 'participants', 'controller',
+    const ui = Object.fromEntries(['back', 'join', 'sound', 'fullscreen', 'role', 'participants', 'controller',
         'play', 'pause', 'seek', 'position', 'status', 'notice'].map(id => [id, document.getElementById(id)]));
     const wantsMaster = new URL(location.href).searchParams.get('master') === 'true';
+    let returnTo = '/library.html?master=true';
+    if (wantsMaster) {
+        let saved;
+        try { saved = JSON.parse(sessionStorage.getItem('videoLibraryReturn')); } catch {}
+        returnTo = VideoNavigation.playerReturn(saved, document.referrer, location.origin);
+        history.replaceState({ videoPlatform: 'player', returnTo }, '');
+        ui.back.hidden = false;
+    }
     // performance.now is monotonic: OS clock changes must not jump the video.
     const localNow = () => performance.timeOrigin + performance.now();
     let clock = new VideoSync.Clock();
@@ -26,6 +34,9 @@
     let registered = false;
     let playPromise = null;
     let failedVersion = null;
+    let mediaGeneration = -1;
+    let mediaLoadVersion = -1;
+    let controllerToken = sessionStorage.getItem('videoControllerToken');
     let needsAlignment = true;
     let lastSeek = -Infinity;
     let dragging = false;
@@ -67,7 +78,7 @@
             if (error.name === 'AbortError' || desired?.version !== version) return;
             failedVersion = version;
             ui.notice.textContent = 'Playback was blocked. Enable playback in this browser, then press Play on the controller.';
-            send({ type: 'playback-error', version });
+            send({ type: 'playback-error', version, mediaGeneration });
         }).finally(() => { playPromise = null; });
     }
 
@@ -77,7 +88,7 @@
         if (Math.abs(video.currentTime - target) > 0.03) {
             if (pending.ready) {
                 pending.ready = false;
-                send({ type: 'not-ready', version: pending.version });
+                send({ type: 'not-ready', version: pending.version, mediaGeneration });
             }
             seekTo(target);
             return;
@@ -87,7 +98,7 @@
         const ready = !video.seeking && (target >= video.duration || (video.readyState >= 3 && buffered));
         if (ready !== !!pending.ready) {
             pending.ready = ready;
-            send({ type: ready ? 'ready' : 'not-ready', version: pending.version });
+            send({ type: ready ? 'ready' : 'not-ready', version: pending.version, mediaGeneration });
             status(ready ? 'Ready. Waiting for the other screens…' : 'Buffering before synchronized start…');
         }
     }
@@ -137,30 +148,55 @@
         } else status('Buffering… Playback will catch up automatically.');
     }
 
+    function applyMedia(message) {
+        if (!Number.isSafeInteger(message.mediaGeneration)) return false;
+        controls(master && !!message.media);
+        mediaLoadVersion = message.version;
+        if (message.mediaGeneration === mediaGeneration) return false;
+        stopLocal();
+        mediaGeneration = message.mediaGeneration;
+        if (message.media?.url) video.src = message.media.url;
+        else video.removeAttribute('src');
+        video.load();
+        controls(master && !!message.media);
+        return true;
+    }
+
     function receive(message) {
         if (message.type === 'clock' && clockRequests.delete(message.sent)) {
             clock.record(message.sent, localNow(), message.serverTime);
             if (++clockReplies >= 5 && !registered) {
                 registered = true;
-                send({ type: 'hello', master: wantsMaster });
+                send({ type: 'hello', master: wantsMaster,
+                    ...(wantsMaster && controllerToken ? { controllerToken } : {}) });
             }
-        } else if (message.type === 'welcome') {
+        } else if (message.type === 'welcome' || message.type === 'role') {
             master = message.master;
             joined = true;
             reconnectAttempt = 0;
-            controls(master);
+            if (master && message.controllerToken) {
+                controllerToken = message.controllerToken;
+                sessionStorage.setItem('videoControllerToken', controllerToken);
+            }
+            controls(master && !!desired?.media);
             ui.controller.hidden = !master;
             ui.role.textContent = master ? 'Controller' : 'Display';
             ui.join.hidden = true;
-            if (video.error) send({ type: 'media-error' });
-            if (wantsMaster && !master) ui.notice.textContent = 'Another controller is already connected. This device is a display.';
+            if (video.error) send({ type: 'media-error', version: mediaLoadVersion, mediaGeneration });
+            if (wantsMaster && !master) ui.notice.textContent = 'Waiting for the controller handoff…';
         } else if (message.type === 'participants') {
             ui.participants.textContent = `${message.count} screen(s) connected`;
-            if (!message.hasMaster) ui.notice.textContent = 'No controller connected. Open /?master=true on the controlling device.';
+            if (!message.hasMaster) {
+                ui.notice.textContent = wantsMaster ? 'Claiming controller role…'
+                    : 'No controller connected. Open /?master=true on the controlling device.';
+                if (wantsMaster) send({ type: 'hello', master: true,
+                    ...(controllerToken ? { controllerToken } : {}) });
+            }
         } else if (message.type === 'notice') {
             ui.notice.textContent = message.message;
         } else if (message.type === 'prepare') {
             if (message.version < Math.max(desired?.version ?? -1, pending?.version ?? -1)) return;
+            applyMedia(message);
             stopLocal();
             desired = null;
             pending = { ...message, ready: false };
@@ -169,6 +205,7 @@
             prepare();
         } else if (message.type === 'state') {
             if (message.version < Math.max(desired?.version ?? -1, pending?.version ?? -1)) return;
+            applyMedia(message);
             const changed = desired?.version !== message.version;
             if (changed) {
                 clearTimeout(startTimer);
@@ -233,6 +270,10 @@
         });
     }
 
+    ui.back.addEventListener('click', () => {
+        if (VideoNavigation.canGoBack(document.referrer, location.origin, history.state)) history.back();
+        else location.assign(returnTo);
+    });
     ui.join.addEventListener('click', () => { ui.join.disabled = true; connect(); });
     ui.play.addEventListener('click', () => {
         ui.notice.textContent = '';
@@ -257,10 +298,13 @@
         video.addEventListener(event, synchronize);
     }
     video.addEventListener('error', () => {
-        ui.notice.textContent = 'The video could not be loaded. Check that the MP4 file exists and the browser supports its codecs.';
-        if (joined) send({ type: 'media-error' });
+        ui.notice.textContent = 'The video could not be loaded. Check that the file exists and the browser supports its container and codecs.';
+        if (joined) send({ type: 'media-error', version: mediaLoadVersion, mediaGeneration });
     });
-    video.addEventListener('ended', () => { if (master && desired?.playing) command('pause'); });
+    video.addEventListener('ended', () => {
+        const action = VideoSync.completionAction(master, desired?.playing);
+        if (action) command(action);
+    });
     document.addEventListener('visibilitychange', () => {
         if (!document.hidden && connected()) { ping(); synchronize(); }
     });

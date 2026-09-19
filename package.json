@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/sync.test.js test/server.test.js",
+    "test": "node --test test/catalog.test.js test/navigation.test.js test/sync.test.js test/server.test.js",
     "test:browser": "node --test test/browser.test.js"
   },
   "author": "",

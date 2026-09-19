@@ -15,15 +15,16 @@
         [hidden] { display: none !important; }
     </style>
     <script defer src="/sync-core.js"></script>
+    <script defer src="/navigation.js"></script>
     <script defer src="/player.js"></script>
 </head>
 <body>
 <main>
     <video id="myVideo" preload="auto" playsinline muted>
-        <source src="/videoURL.mp4" type="video/mp4">
         Your browser does not support HTML video.
     </video>
     <div class="toolbar">
+        <button id="back" hidden>Back</button>
         <button id="join">Join screens</button>
         <button id="sound">Enable sound</button>
         <button id="fullscreen">Fullscreen</button>

@@ -4,16 +4,28 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
-const { mkdtemp, rm } = require('node:fs/promises');
+const { mkdtemp, mkdir, copyFile, rm } = require('node:fs/promises');
+const { existsSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createServer } = require('../index');
 
 const chromePath = process.env.CHROMIUM_PATH;
-test('two browser screens: buffered start, drift correction, pause, seek, late join and reconnect',
-    { skip: !chromePath && 'Set CHROMIUM_PATH to run the real-browser test', timeout: 120000 }, async t => {
-    const profile = await mkdtemp(path.join(os.tmpdir(), 'video-sync-chrome-'));
-    const { server, wsServer } = createServer();
+const defaultVideo = path.join(__dirname, '..', 'videosSource', 'PinkyAndBrain', '1.mp4');
+const browserVideo = process.env.BROWSER_TEST_VIDEO || defaultVideo;
+const skipReason = !chromePath ? 'Set CHROMIUM_PATH to run the real-browser test'
+    : !existsSync(browserVideo) ? 'Set BROWSER_TEST_VIDEO to a browser-playable video of at least 30 seconds' : false;
+test('two browser screens: library handoff, buffered start, drift correction, seek and reconnect',
+    { skip: skipReason, timeout: 120000 }, async t => {
+    const baseDirectory = await mkdtemp(path.join(os.tmpdir(), 'video-sync-browser-'));
+    const profile = path.join(baseDirectory, 'profile');
+    const videosRoot = path.join(baseDirectory, 'videos');
+    await mkdir(path.join(videosRoot, 'Fixture'), { recursive: true });
+    await copyFile(browserVideo, path.join(videosRoot, 'Fixture', 'sync-fixture.mp4'));
+    const { server, wsServer, catalog } = createServer({
+        videosRoot, dataFile: path.join(baseDirectory, 'data', 'metadata.json'),
+        catalogOptions: { watch: false, settleMs: 0, safetyMinMs: 600000 },
+    });
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -22,14 +34,17 @@ test('two browser screens: buffered start, drift correction, pause, seek, late j
         '--disable-backgrounding-occluded-windows', '--remote-debugging-port=0',
         `--user-data-dir=${profile}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
     let cdp;
+    let blocker;
     t.after(async () => {
+        blocker?.close();
         cdp?.close();
         const exited = once(chrome, 'exit');
         chrome.kill('SIGKILL');
         await exited;
         wsServer.shutDown();
         await new Promise(resolve => server.close(resolve));
-        await rm(profile, { recursive: true, force: true });
+        await catalog.close();
+        await rm(baseDirectory, { recursive: true, force: true });
     });
     const endpoint = await new Promise((resolve, reject) => {
         let log = '';
@@ -97,7 +112,11 @@ test('two browser screens: buffered start, drift correction, pause, seek, late j
                 }
             };
         ` }, sessionId);
-        await call('Page.navigate', { url: base + (master ? '/?master=true' : '/') }, sessionId);
+        await call('Page.navigate', { url: base + (master ? '/library.html?master=true' : '/') }, sessionId);
+        if (master) {
+            await until(sessionId, `document.body.dataset.controller === 'true' && !!document.querySelector('.video') && !document.querySelector('#error').textContent`);
+            await evaluate(sessionId, `document.querySelector('.video').click()`);
+        }
         await until(sessionId, `!!document.querySelector('#join') && document.readyState === 'complete'`);
         await evaluate(sessionId, `document.querySelector('#join').click()`);
         await until(sessionId, `document.querySelector('#join').hidden`);
@@ -107,6 +126,22 @@ test('two browser screens: buffered start, drift correction, pause, seek, late j
     const master = await page(true);
     const display = await page(false, 45000);
     t.diagnostic('Initial media: ' + JSON.stringify(await evaluate(display, `({ready:document.querySelector('video').readyState,duration:document.querySelector('video').duration,buffered:Array.from({length:document.querySelector('video').buffered.length},(_,i)=>[document.querySelector('video').buffered.start(i),document.querySelector('video').buffered.end(i)])})`)));
+
+    // Hold the readiness barrier open and prove a real browser media error uses the current
+    // preparation version rather than waiting for the readiness timeout.
+    blocker = new WebSocket(base.replace('http:', 'ws:'), 'echo-protocol');
+    await once(blocker, 'open');
+    blocker.send(JSON.stringify({ type: 'hello' }));
+    await until(master, `document.querySelector('#participants').textContent.startsWith('3 ')`);
+    await evaluate(master, `document.querySelector('#play').click()`);
+    await until(display, `document.querySelector('#status').textContent.includes('Waiting for the other screens')`);
+    await evaluate(display, `document.querySelector('video').dispatchEvent(new Event('error'))`);
+    await until(master, `document.querySelector('#notice').textContent.includes('could not load')`);
+    assert.equal(await evaluate(master, `document.querySelector('video').paused`), true);
+    blocker.close();
+    blocker = null;
+    await until(master, `document.querySelector('#participants').textContent.startsWith('2 ')`);
+
     await evaluate(master, `document.querySelector('#play').click()`);
     await until(master, `!document.querySelector('video').paused && document.querySelector('video').currentTime > 1`);
     await until(display, `!document.querySelector('video').paused && document.querySelector('video').currentTime > 1`);
