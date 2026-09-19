@@ -8,6 +8,13 @@
         body { margin: 0; background: #121212; color: #eee; font: 16px system-ui, sans-serif; }
         main { max-width: 1200px; margin: auto; padding: 16px; }
         video { display: block; width: 100%; max-height: 78vh; background: black; }
+        video:fullscreen, video:-webkit-full-screen {
+            width: 100vw;
+            height: 100vh;
+            max-height: none;
+            object-fit: contain;
+            background: black;
+        }
         .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
         button { padding: 10px 16px; cursor: pointer; }
         input[type=range] { flex: 1; min-width: 160px; }

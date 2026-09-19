@@ -291,8 +291,9 @@
         ui.sound.textContent = video.muted ? 'Enable sound' : 'Mute';
     });
     ui.fullscreen.addEventListener('click', () => {
-        const request = document.querySelector('main').requestFullscreen?.();
+        const request = video.requestFullscreen?.();
         if (request) request.catch(() => { ui.notice.textContent = 'Fullscreen is unavailable in this browser.'; });
+        else ui.notice.textContent = 'Fullscreen is unavailable in this browser.';
     });
     for (const event of ['loadedmetadata', 'canplay', 'seeked', 'progress', 'waiting']) {
         video.addEventListener(event, synchronize);
