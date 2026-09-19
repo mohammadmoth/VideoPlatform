@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { SyncRoom } = require('../lib/sync-room');
-const { Clock, targetTime, correction, hasRunway, completionAction } = require('../frontend/sync-core');
+const { Clock, targetTime, correction, CorrectionController, hasRunway, completionAction } = require('../frontend/sync-core');
 
 function setup() {
     let time = 100000;
@@ -42,12 +42,59 @@ test('target handles zero, future start, paused state and media end without abso
 });
 
 test('small drift adjusts rate rather than seeking; large drift seeks', () => {
-    assert.deepEqual(correction(10, 10.02), { rate: 1 });
-    assert.ok(correction(10, 10.2).rate > 1);
+    assert.deepEqual(correction(10, 10), { rate: 1 });
+    assert.ok(correction(10, 10.02).rate > 1);
     assert.ok(correction(10, 9.8).rate < 1);
     assert.equal(correction(10, 10.7).rate, 1.04);
     assert.equal(correction(10, 9.3).rate, 0.96);
     assert.deepEqual(correction(10, 12), { seek: 12, rate: 1 });
+});
+
+test('adaptive correction uses reliable filtered 50ms/10ms hysteresis and stable cadence', () => {
+    const controller = new CorrectionController();
+    const sample = drift => controller.next(10, 10 + drift);
+    assert.equal(controller.interval(), 100);
+    sample(0.05); sample(0.05);
+    assert.equal(sample(0.05), null, '50ms exactly does not enter correction');
+    assert.equal(controller.state, 'stable');
+    assert.equal(controller.interval(), 1000);
+
+    controller.reset();
+    sample(0.051); sample(0.051);
+    assert.ok(sample(0.051).rate > 1, 'filtered drift above 50ms enters correction');
+    assert.equal(controller.state, 'correcting');
+    assert.equal(controller.interval(), 100);
+
+    sample(0.01); sample(0.01);
+    assert.ok(sample(0.01).rate > 1, 'correction remains active at 10ms');
+    assert.equal(controller.state, 'correcting');
+    sample(0.009);
+    assert.deepEqual(sample(0.009), { rate: 1, settled: true });
+    assert.equal(controller.state, 'stable');
+    assert.equal(controller.interval(), 1000);
+    assert.equal(sample(0.009), null, 'settled checks do not rewrite the rate');
+});
+
+test('adaptive correction rejects noisy samples, resets on lifecycle recovery, and seeks large drift', () => {
+    const controller = new CorrectionController();
+    const sample = drift => controller.next(10, 10 + drift);
+    sample(0.001); sample(0.2);
+    assert.equal(sample(0.001), null, 'one noisy 100ms sample cannot enter correction');
+    assert.equal(controller.state, 'stable');
+
+    controller.reset();
+    sample(-0.2); sample(0); sample(0.2);
+    assert.equal(controller.state, 'aligning', 'unreliable samples keep fast alignment checks');
+    assert.equal(controller.interval(), 100);
+    assert.deepEqual(sample(1), { seek: 11, rate: 1 }, 'large drift bypasses the filter for recovery');
+    assert.equal(controller.state, 'aligning');
+
+    sample(0.06); sample(0.06); sample(0.06);
+    assert.equal(controller.state, 'correcting');
+    controller.reset();
+    assert.equal(controller.state, 'aligning', 'lifecycle reset discards prior correction state');
+    assert.equal(controller.interval(), 100);
+    assert.equal(sample(0.06), null, 'a reset requires fresh reliable samples');
 });
 
 test('play waits for every screen then schedules identical future start', () => {

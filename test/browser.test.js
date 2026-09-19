@@ -151,9 +151,15 @@ test('two browser screens: library handoff, buffered start, drift correction, se
     assert.ok(Math.abs(positions[0] - positions[1]) < 0.15, JSON.stringify(positions));
     assert.equal(await evaluate(display, 'window.seekCount'), 0, 'startup should not repeatedly seek');
 
-    await evaluate(display, `document.querySelector('video').currentTime -= 0.2`);
-    await until(display, `document.querySelector('video').playbackRate > 1`);
+    // Slow media progression without seeking so this remains a steady-state drift test.
     const seeks = await evaluate(display, 'window.seekCount');
+    await evaluate(display, `(async () => {
+        const video = document.querySelector('video');
+        video.playbackRate = 0.8;
+        await new Promise(resolve => setTimeout(resolve, 500));
+        video.playbackRate = 1;
+    })()`);
+    await until(display, `document.querySelector('video').playbackRate > 1`);
     await until(master, `document.querySelector('video').currentTime > 4`);
     assert.equal(await evaluate(display, 'window.seekCount'), seeks, 'small drift must be corrected without jumps');
 
@@ -190,5 +196,19 @@ test('two browser screens: library handoff, buffered start, drift correction, se
     await until(display, `window.syncSockets.length > ${socketCount} && document.querySelector('#join').hidden && !document.querySelector('video').paused`);
     positions = await Promise.all([time(master), time(display)]);
     assert.ok(Math.abs(positions[0] - positions[1]) < 0.2, `Page restoration: ${positions}`);
+
+    // Pausing during pagehide emits a lifecycle event; it must not recreate the cleared sync timeout.
+    const pagehideTimeouts = await evaluate(display, `(async () => {
+        const nativeSetTimeout = window.setTimeout;
+        const scheduled = [];
+        window.setTimeout = (callback, delay, ...args) => {
+            scheduled.push(delay);
+            return nativeSetTimeout(callback, delay, ...args);
+        };
+        window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+        await new Promise(resolve => nativeSetTimeout(resolve, 100));
+        return scheduled;
+    })()`);
+    assert.deepEqual(pagehideTimeouts, [], 'pagehide pause must not reschedule synchronization');
     assert.deepEqual(exceptions, []);
 });

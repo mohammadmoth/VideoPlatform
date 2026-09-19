@@ -39,6 +39,11 @@
     let controllerToken = sessionStorage.getItem('videoControllerToken');
     let needsAlignment = true;
     let lastSeek = -Infinity;
+    let expectedSeek = false;
+    let correctionController = new VideoSync.CorrectionController();
+    let appliedPlaybackRate = 1;
+    let syncTimer;
+    let uiTimer;
     let dragging = false;
     let disposed = false;
 
@@ -53,11 +58,28 @@
         if (clockRequests.size > 40) clockRequests.delete(clockRequests.values().next().value);
         send({ type: 'clock', sent });
     }
+    function setPlaybackRate(rate) {
+        // Media implementations can change this value while buffering; verify the DOM value too.
+        if (rate === appliedPlaybackRate && video.playbackRate === rate) return;
+        // Tiny filtered-drift changes are inaudible but frequent writes are not.
+        if (rate !== 1 && video.playbackRate === appliedPlaybackRate
+            && Math.abs(rate - appliedPlaybackRate) < 0.002) return;
+        video.playbackRate = rate;
+        appliedPlaybackRate = rate;
+    }
+    function resetCorrection() {
+        correctionController.reset();
+        setPlaybackRate(1);
+    }
+    function enterAlignment() {
+        needsAlignment = true;
+        resetCorrection();
+    }
     function stopLocal() {
         clearTimeout(startTimer);
         startTimer = null;
         video.pause();
-        video.playbackRate = 1;
+        resetCorrection();
     }
     function controls(enabled) {
         ui.play.disabled = ui.pause.disabled = ui.seek.disabled = !enabled;
@@ -65,10 +87,14 @@
     function seekTo(position) {
         if (!video.readyState || video.seeking) return false;
         try {
+            expectedSeek = true;
             video.currentTime = position;
             lastSeek = localNow();
             return true;
-        } catch { return false; }
+        } catch {
+            expectedSeek = false;
+            return false;
+        }
     }
     function play() {
         if (!video.paused || playPromise || failedVersion === desired?.version) return;
@@ -114,12 +140,13 @@
         if (!desired.playing || now < desired.at) {
             needsAlignment = false;
             if (!video.paused) video.pause();
-            video.playbackRate = 1;
+            setPlaybackRate(1);
             if (Math.abs(video.currentTime - target) > 0.04) seekTo(target);
             if (desired.playing && !startTimer) {
                 startTimer = setTimeout(() => {
                     startTimer = null;
-                    synchronize();
+                    enterAlignment();
+                    restartSynchronization();
                 }, Math.max(1, desired.at - serverNow()));
             }
             status(desired.playing ? 'Starting all screens together…' : 'Paused');
@@ -132,12 +159,12 @@
             needsAlignment = false;
             if (Math.abs(video.currentTime - target) > 0.04 && seekTo(target)) return;
         }
-        const adjustment = VideoSync.correction(video.currentTime, target);
+        const adjustment = correctionController.next(video.currentTime, target);
         // Large errors (late join, reconnect, stall) need a seek. Small ones only change rate.
-        if (adjustment.seek !== undefined && localNow() - lastSeek > 1500) {
-            seekTo(adjustment.seek);
-            video.playbackRate = 1;
-        } else video.playbackRate = adjustment.rate;
+        if (adjustment?.seek !== undefined) {
+            if (localNow() - lastSeek > 1500) seekTo(adjustment.seek);
+            setPlaybackRate(1);
+        } else if (adjustment) setPlaybackRate(adjustment.rate);
         if (video.currentTime >= video.duration && target >= video.duration) {
             status('Finished');
             return;
@@ -148,12 +175,20 @@
         } else status('Buffering… Playback will catch up automatically.');
     }
 
+    function restartSynchronization() {
+        if (disposed) return;
+        clearTimeout(syncTimer);
+        synchronize();
+        syncTimer = setTimeout(restartSynchronization, correctionController.interval());
+    }
+
     function applyMedia(message) {
         if (!Number.isSafeInteger(message.mediaGeneration)) return false;
         controls(master && !!message.media);
         mediaLoadVersion = message.version;
         if (message.mediaGeneration === mediaGeneration) return false;
         stopLocal();
+        enterAlignment();
         mediaGeneration = message.mediaGeneration;
         if (message.media?.url) video.src = message.media.url;
         else video.removeAttribute('src');
@@ -172,6 +207,7 @@
             }
         } else if (message.type === 'welcome' || message.type === 'role') {
             master = message.master;
+            enterAlignment();
             joined = true;
             reconnectAttempt = 0;
             if (master && message.controllerToken) {
@@ -184,6 +220,7 @@
             ui.join.hidden = true;
             if (video.error) send({ type: 'media-error', version: mediaLoadVersion, mediaGeneration });
             if (wantsMaster && !master) ui.notice.textContent = 'Waiting for the controller handoff…';
+            restartSynchronization();
         } else if (message.type === 'participants') {
             ui.participants.textContent = `${message.count} screen(s) connected`;
             if (!message.hasMaster) {
@@ -211,11 +248,12 @@
                 clearTimeout(startTimer);
                 startTimer = null;
                 failedVersion = null;
+                enterAlignment();
             }
             if (!(pending && message.playing && message.preparationVersion === pending.version
                 && serverNow() < message.at)) pending = null;
             desired = message;
-            synchronize();
+            restartSynchronization();
         }
     }
 
@@ -228,6 +266,7 @@
         desired = pending = null;
         joined = master = false;
         stopLocal();
+        needsAlignment = true;
         controls(false);
         ui.join.hidden = false;
         ui.join.disabled = false;
@@ -244,7 +283,8 @@
         clockRequests = new Set();
         clockReplies = 0;
         registered = false;
-        needsAlignment = true;
+        enterAlignment();
+        restartSynchronization();
         status('Connecting and measuring server time…');
         const active = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/`, 'echo-protocol');
         socket = active;
@@ -295,9 +335,23 @@
         if (request) request.catch(() => { ui.notice.textContent = 'Fullscreen is unavailable in this browser.'; });
         else ui.notice.textContent = 'Fullscreen is unavailable in this browser.';
     });
-    for (const event of ['loadedmetadata', 'canplay', 'seeked', 'progress', 'waiting']) {
-        video.addEventListener(event, synchronize);
+    function recoverFromLifecycle() {
+        enterAlignment();
+        restartSynchronization();
     }
+    for (const event of ['loadedmetadata', 'canplay', 'play', 'pause', 'playing', 'waiting',
+        'stalled', 'suspend', 'emptied', 'durationchange']) {
+        video.addEventListener(event, recoverFromLifecycle);
+    }
+    for (const event of ['seeking', 'seeked']) {
+        video.addEventListener(event, () => {
+            if (!expectedSeek) return recoverFromLifecycle();
+            if (event === 'seeked') expectedSeek = false;
+            restartSynchronization();
+        });
+    }
+    // Buffer progress only informs readiness; UI rendering has its own independent timer.
+    video.addEventListener('progress', prepare);
     video.addEventListener('error', () => {
         ui.notice.textContent = 'The video could not be loaded. Check that the file exists and the browser supports its container and codecs.';
         if (joined) send({ type: 'media-error', version: mediaLoadVersion, mediaGeneration });
@@ -307,20 +361,24 @@
         if (action) command(action);
     });
     document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && connected()) { ping(); synchronize(); }
+        if (!document.hidden && connected()) {
+            ping();
+            recoverFromLifecycle();
+        }
     });
-    function update() {
-        synchronize();
+    function updateUi() {
         if (Number.isFinite(video.duration)) ui.seek.max = video.duration;
         if (!dragging) ui.seek.value = video.currentTime;
         const seconds = Math.floor(video.currentTime);
         ui.position.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
     }
-    let syncTimer = setInterval(update, 100);
+    restartSynchronization();
+    uiTimer = setInterval(updateUi, 100);
     window.addEventListener('pagehide', () => {
         resumeConnection = !!socket || !!reconnectTimer;
         disposed = true;
-        clearInterval(syncTimer);
+        clearTimeout(syncTimer);
+        clearInterval(uiTimer);
         clearTimeout(reconnectTimer);
         stopLocal();
         if (socket) connectionLost(socket);
@@ -328,7 +386,8 @@
     window.addEventListener('pageshow', event => {
         if (!event.persisted) return;
         disposed = false;
-        syncTimer = setInterval(update, 100);
+        restartSynchronization();
+        uiTimer = setInterval(updateUi, 100);
         if (resumeConnection) connect();
     });
 })();
