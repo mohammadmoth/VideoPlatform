@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Synchronized video</title>
+    <style>
+        body { margin: 0; background: #121212; color: #eee; font: 16px system-ui, sans-serif; }
+        main { max-width: 1200px; margin: auto; padding: 16px; }
+        video { display: block; width: 100%; max-height: 78vh; background: black; }
+        .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+        button { padding: 10px 16px; cursor: pointer; }
+        input[type=range] { flex: 1; min-width: 160px; }
+        #notice { color: #ffd180; }
+        [hidden] { display: none !important; }
+    </style>
+    <script defer src="/sync-core.js"></script>
+    <script defer src="/player.js"></script>
+</head>
+<body>
+<main>
+    <video id="myVideo" preload="auto" playsinline muted>
+        <source src="/videoURL.mp4" type="video/mp4">
+        Your browser does not support HTML video.
+    </video>
+    <div class="toolbar">
+        <button id="join">Join screens</button>
+        <button id="sound">Enable sound</button>
+        <button id="fullscreen">Fullscreen</button>
+        <span id="role"></span>
+        <span id="participants"></span>
+    </div>
+    <div id="controller" class="toolbar" hidden>
+        <button id="play" disabled>Play</button>
+        <button id="pause" disabled>Pause</button>
+        <input id="seek" aria-label="Video position" type="range" min="0" max="0" step="0.1" value="0" disabled>
+        <span id="position">0:00</span>
+    </div>
+    <p id="status" role="status">Click “Join screens” on each device before starting playback.</p>
+    <p id="notice" role="alert"></p>
+</main>
+</body>
+</html>
